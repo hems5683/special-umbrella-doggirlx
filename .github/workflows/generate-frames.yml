@@ -62,10 +62,16 @@ jobs:
             git push origin HEAD:main
           fi
 
-      - name: Upload repository as Pages artifact
+      - name: Prepare clean Pages site
+        run: |
+          rm -rf _site
+          mkdir -p _site
+          cp -a frames _site/frames
+
+      - name: Upload frame galleries as Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: .
+          path: _site/
 
       - name: Deploy GitHub Pages
         id: deployment
