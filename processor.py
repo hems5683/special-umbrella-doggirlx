@@ -1,0 +1,146 @@
+import hashlib
+import hmac
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import time
+from pathlib import Path
+from urllib.parse import urlparse
+
+import psycopg
+import requests
+
+REPO = "hems5683/special-umbrella-doggirlx"
+SITE_BASE = f"https://{REPO.split('/')[0]}.github.io/{REPO.split('/')[1]}"
+FRAMES_ROOT = Path("frames")
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "30"))
+FRAME_COUNT = int(os.getenv("FRAME_COUNT", "30"))
+SECRET = os.getenv("VIDEO_SIGNING_SECRET", "").encode()
+
+
+def is_full_url(value):
+    return isinstance(value, str) and value.startswith(("http://", "https://"))
+
+
+def sign_video_url(filename, expires_in=1800):
+    if is_full_url(filename):
+        return filename
+    if not filename.startswith("b2/"):
+        clean_name = filename if filename.endswith(".mp4") else filename + ".mp4"
+        return f"https://media2.doggirlx.com/{clean_name}"
+    if not SECRET:
+        raise RuntimeError("VIDEO_SIGNING_SECRET is required for b2/ video sources")
+    expires = int(time.time()) + expires_in
+    key = filename.removeprefix("b2/")
+    sig = hmac.new(SECRET, f"{key}:{expires}".encode(), hashlib.sha256).hexdigest()
+    return f"https://media.doggirlx.com/video/{filename}?e={expires}&sig={sig}"
+
+
+def safe_stem(source, row_id):
+    name = urlparse(source).path.rsplit("/", 1)[-1] if is_full_url(source) else source
+    name = name.removeprefix("b2/").rsplit("/", 1)[-1]
+    name = re.sub(r"\.mp4$", "", name, flags=re.IGNORECASE)
+    name = re.sub(r"[^A-Za-z0-9_-]+", "-", name).strip("-_")
+    return name[:100] or f"video-{row_id}"
+
+
+def render_page(folder, title, stem, count):
+    images = "\n".join(
+        f'<figure><a href="{stem}_{i}.jpg" target="_blank"><img loading="lazy" src="{stem}_{i}.jpg" alt="Frame {i}"></a><figcaption>Frame {i}</figcaption></figure>'
+        for i in range(1, count + 1)
+    )
+    escaped_title = (title or stem).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    html = f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{escaped_title} — video frames</title>
+<style>
+*{{box-sizing:border-box}}body{{margin:0;background:#111;color:#eee;font:16px/1.5 system-ui,sans-serif}}
+header{{padding:1.25rem 2vw;background:#1b1b1b;position:sticky;top:0}}h1{{font-size:1.2rem;margin:0}}p{{color:#aaa;margin:.25rem 0 0}}
+main{{padding:2vw;display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:14px}}
+figure{{margin:0;background:#202020;border-radius:8px;overflow:hidden}}img{{display:block;width:100%;aspect-ratio:16/9;object-fit:contain;background:#000}}figcaption{{padding:7px 10px;color:#bbb;font-size:.85rem}}
+</style></head><body><header><h1>{escaped_title}</h1><p>{count} sampled frames</p></header><main>{images}</main></body></html>"""
+    (folder / "index.html").write_text(html, encoding="utf-8")
+
+
+def main():
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        raise RuntimeError("Set DATABASE_URL in GitHub Actions secrets")
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        raise RuntimeError("ffmpeg and ffprobe must be installed")
+
+    FRAMES_ROOT.mkdir(parents=True, exist_ok=True)
+    with psycopg.connect(database_url, autocommit=True) as conn:
+        conn.execute("ALTER TABLE doggirlx ADD COLUMN IF NOT EXISTS frames_url TEXT")
+        conn.execute("ALTER TABLE doggirlx ADD COLUMN IF NOT EXISTS frames_status TEXT")
+        rows = conn.execute(
+            """SELECT id, title, video_src
+               FROM doggirlx
+               WHERE video_src IS NOT NULL
+                 AND COALESCE(frames_url, '') = ''
+                 AND COALESCE(frames_status, '') NOT IN ('processing')
+               ORDER BY id
+               LIMIT %s""",
+            (BATCH_SIZE,),
+        ).fetchall()
+
+        for row_id, title, video_src in rows:
+            folder = None
+            try:
+                conn.execute("UPDATE doggirlx SET frames_status = 'processing' WHERE id = %s", (row_id,))
+                video_url = sign_video_url(str(video_src))
+                stem = safe_stem(str(video_src), row_id)
+                folder = FRAMES_ROOT / f"{row_id}-{stem}"
+                folder.mkdir(parents=True, exist_ok=True)
+
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    video_path = Path(temp_dir) / "source.mp4"
+                    response = requests.get(video_url, stream=True, timeout=(30, 180))
+                    response.raise_for_status()
+                    with video_path.open("wb") as output:
+                        for chunk in response.iter_content(chunk_size=1024 * 1024):
+                            if chunk:
+                                output.write(chunk)
+
+                    probe = subprocess.run(
+                        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                         "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)],
+                        check=True, capture_output=True, text=True,
+                    )
+                    duration = float(probe.stdout.strip())
+                    if duration <= 0:
+                        raise ValueError("Video duration is not positive")
+
+                    count = max(1, FRAME_COUNT)
+                    for i in range(1, count + 1):
+                        timestamp = duration * i / (count + 1)
+                        output_path = folder / f"{stem}_{i}.jpg"
+                        subprocess.run(
+                            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-ss", str(timestamp),
+                             "-i", str(video_path), "-frames:v", "1", "-q:v", "3", "-y", str(output_path)],
+                            check=True, capture_output=True,
+                        )
+                        if not output_path.exists() or output_path.stat().st_size == 0:
+                            raise RuntimeError(f"Frame {i} was not generated")
+
+                render_page(folder, title, stem, count)
+                page_url = f"{SITE_BASE}/{folder.as_posix()}/"
+                conn.execute(
+                    "UPDATE doggirlx SET frames_url = %s, frames_status = 'done' WHERE id = %s",
+                    (page_url, row_id),
+                )
+                print(f"Processed database id={row_id}: {page_url}")
+            except Exception as exc:
+                if folder and folder.exists():
+                    shutil.rmtree(folder, ignore_errors=True)
+                conn.execute(
+                    "UPDATE doggirlx SET frames_status = %s WHERE id = %s",
+                    (f"error: {str(exc)[:450]}", row_id),
+                )
+                print(f"Failed database id={row_id}: {exc}")
+
+
+if __name__ == "__main__":
+    main()
