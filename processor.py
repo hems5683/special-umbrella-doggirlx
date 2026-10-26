@@ -91,6 +91,7 @@ def main():
             conn.execute(
                 """UPDATE doggirlx
                    SET frames_status = 'processing',
+                       frames_path = NULL,
                        frames_attempts = frames_attempts + 1,
                        frames_error = NULL
                    WHERE id = %s""",
