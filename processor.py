@@ -79,7 +79,6 @@ def main():
             """SELECT id, title, video_src, frames_attempts
                FROM doggirlx
                WHERE video_src IS NOT NULL
-                 AND COALESCE(frames_url, '') = ''
                  AND frames_status IN ('pending', 'error', 'processing')
                  AND frames_attempts < %s
                ORDER BY frames_attempts ASC, id ASC
@@ -138,12 +137,14 @@ def main():
                 render_page(folder, title, stem, count)
                 conn.execute(
                     """UPDATE doggirlx
-                       SET frames_status = 'generated', frames_error = NULL,
+                       SET frames_status = 'generated',
+                           frames_path = %s,
+                           frames_error = NULL,
                            frames_generated_at = NOW()
                        WHERE id = %s""",
-                    (row_id,),
+                    (folder.as_posix().rstrip("/") + "/", row_id),
                 )
-                print(f"Generated frames for id={row_id}; URL will be stored after Pages deploy.")
+                print(f"Generated frames for id={row_id}; path={folder.as_posix()}/")
             except Exception as exc:
                 if folder and folder.exists():
                     shutil.rmtree(folder, ignore_errors=True)
@@ -160,7 +161,6 @@ def main():
             """SELECT EXISTS (
                  SELECT 1 FROM doggirlx
                  WHERE video_src IS NOT NULL
-                   AND COALESCE(frames_url, '') = ''
                    AND (
                      frames_status IN ('pending', 'processing')
                      OR (frames_status = 'error' AND frames_attempts < %s)
