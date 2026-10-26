@@ -80,7 +80,7 @@ def main():
                FROM doggirlx
                WHERE video_src IS NOT NULL
                  AND COALESCE(frames_url, '') = ''
-                 AND frames_status IN ('pending', 'error')
+                 AND frames_status IN ('pending', 'error', 'processing')
                  AND frames_attempts < %s
                ORDER BY frames_attempts ASC, id ASC
                LIMIT %s""",
@@ -162,7 +162,7 @@ def main():
                  WHERE video_src IS NOT NULL
                    AND COALESCE(frames_url, '') = ''
                    AND (
-                     frames_status = 'pending'
+                     frames_status IN ('pending', 'processing')
                      OR (frames_status = 'error' AND frames_attempts < %s)
                    )
                )""",
