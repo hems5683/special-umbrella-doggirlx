@@ -6,12 +6,13 @@ on:
     - cron: "17 */6 * * *"
 
 permissions:
-  contents: read
+  contents: write
   pages: write
   id-token: write
+  actions: write
 
 concurrency:
-  group: github-pages
+  group: doggirlx-frame-pipeline
   cancel-in-progress: false
 
 jobs:
@@ -24,6 +25,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -38,19 +42,48 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Generate frames and update database
+      - name: Generate up to 30 videos
+        id: frames
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           VIDEO_SIGNING_SECRET: ${{ secrets.VIDEO_SIGNING_SECRET }}
           FRAME_COUNT: "30"
           BATCH_SIZE: "30"
+          MAX_ATTEMPTS: "5"
         run: python processor.py
 
-      - name: Upload site for GitHub Pages
+      - name: Commit frame files directly to repository
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add frames/
+          if ! git diff --cached --quiet; then
+            git commit -m "Generate video frame galleries"
+            git push origin HEAD:main
+          fi
+
+      - name: Upload repository as Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: .
 
-      - name: Deploy to GitHub Pages
+      - name: Deploy GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
+
+      - name: Save published gallery URLs to database
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python finalize.py
+
+      - name: Start next batch automatically
+        if: steps.frames.outputs.has_more == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.FRAME_WORKFLOW_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "More videos remain, but FRAME_WORKFLOW_TOKEN is not configured."
+            echo "Create a fine-grained PAT with Actions: write and Contents: read, then save it as FRAME_WORKFLOW_TOKEN."
+            exit 1
+          fi
+          gh workflow run generate-frames.yml --ref main
