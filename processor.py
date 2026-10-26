@@ -8,6 +8,7 @@ import tempfile
 import time
 from pathlib import Path
 from urllib.parse import urlparse
+from html import escape
 
 import psycopg
 import requests
@@ -17,6 +18,7 @@ SITE_BASE = f"https://{REPO.split('/')[0]}.github.io/{REPO.split('/')[1]}"
 FRAMES_ROOT = Path("frames")
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "30"))
 FRAME_COUNT = int(os.getenv("FRAME_COUNT", "30"))
+MAX_ATTEMPTS = int(os.getenv("MAX_ATTEMPTS", "5"))
 SECRET = os.getenv("VIDEO_SIGNING_SECRET", "").encode()
 
 
@@ -51,16 +53,16 @@ def render_page(folder, title, stem, count):
         f'<figure><a href="{stem}_{i}.jpg" target="_blank"><img loading="lazy" src="{stem}_{i}.jpg" alt="Frame {i}"></a><figcaption>Frame {i}</figcaption></figure>'
         for i in range(1, count + 1)
     )
-    escaped_title = (title or stem).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    safe_title = escape(str(title or stem))
     html = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{escaped_title} — video frames</title>
+<title>{safe_title} — video frames</title>
 <style>
 *{{box-sizing:border-box}}body{{margin:0;background:#111;color:#eee;font:16px/1.5 system-ui,sans-serif}}
 header{{padding:1.25rem 2vw;background:#1b1b1b;position:sticky;top:0}}h1{{font-size:1.2rem;margin:0}}p{{color:#aaa;margin:.25rem 0 0}}
 main{{padding:2vw;display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:14px}}
 figure{{margin:0;background:#202020;border-radius:8px;overflow:hidden}}img{{display:block;width:100%;aspect-ratio:16/9;object-fit:contain;background:#000}}figcaption{{padding:7px 10px;color:#bbb;font-size:.85rem}}
-</style></head><body><header><h1>{escaped_title}</h1><p>{count} sampled frames</p></header><main>{images}</main></body></html>"""
+</style></head><body><header><h1>{safe_title}</h1><p>{count} sampled frames</p></header><main>{images}</main></body></html>"""
     (folder / "index.html").write_text(html, encoding="utf-8")
 
 
@@ -73,36 +75,44 @@ def main():
 
     FRAMES_ROOT.mkdir(parents=True, exist_ok=True)
     with psycopg.connect(database_url, autocommit=True) as conn:
-        conn.execute("ALTER TABLE doggirlx ADD COLUMN IF NOT EXISTS frames_url TEXT")
-        conn.execute("ALTER TABLE doggirlx ADD COLUMN IF NOT EXISTS frames_status TEXT")
         rows = conn.execute(
-            """SELECT id, title, video_src
+            """SELECT id, title, video_src, frames_attempts
                FROM doggirlx
                WHERE video_src IS NOT NULL
                  AND COALESCE(frames_url, '') = ''
-                 AND COALESCE(frames_status, '') NOT IN ('processing')
-               ORDER BY id
+                 AND frames_status IN ('pending', 'error')
+                 AND frames_attempts < %s
+               ORDER BY frames_attempts ASC, id ASC
                LIMIT %s""",
-            (BATCH_SIZE,),
+            (MAX_ATTEMPTS, BATCH_SIZE),
         ).fetchall()
 
-        for row_id, title, video_src in rows:
+        for row_id, title, video_src, attempts in rows:
             folder = None
+            conn.execute(
+                """UPDATE doggirlx
+                   SET frames_status = 'processing',
+                       frames_attempts = frames_attempts + 1,
+                       frames_error = NULL
+                   WHERE id = %s""",
+                (row_id,),
+            )
             try:
-                conn.execute("UPDATE doggirlx SET frames_status = 'processing' WHERE id = %s", (row_id,))
                 video_url = sign_video_url(str(video_src))
                 stem = safe_stem(str(video_src), row_id)
                 folder = FRAMES_ROOT / f"{row_id}-{stem}"
+                if folder.exists():
+                    shutil.rmtree(folder)
                 folder.mkdir(parents=True, exist_ok=True)
 
                 with tempfile.TemporaryDirectory() as temp_dir:
                     video_path = Path(temp_dir) / "source.mp4"
-                    response = requests.get(video_url, stream=True, timeout=(30, 180))
-                    response.raise_for_status()
-                    with video_path.open("wb") as output:
-                        for chunk in response.iter_content(chunk_size=1024 * 1024):
-                            if chunk:
-                                output.write(chunk)
+                    with requests.get(video_url, stream=True, timeout=(30, 180)) as response:
+                        response.raise_for_status()
+                        with video_path.open("wb") as output:
+                            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                                if chunk:
+                                    output.write(chunk)
 
                     probe = subprocess.run(
                         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -126,20 +136,42 @@ def main():
                             raise RuntimeError(f"Frame {i} was not generated")
 
                 render_page(folder, title, stem, count)
-                page_url = f"{SITE_BASE}/{folder.as_posix()}/"
                 conn.execute(
-                    "UPDATE doggirlx SET frames_url = %s, frames_status = 'done' WHERE id = %s",
-                    (page_url, row_id),
+                    """UPDATE doggirlx
+                       SET frames_status = 'generated', frames_error = NULL,
+                           frames_generated_at = NOW()
+                       WHERE id = %s""",
+                    (row_id,),
                 )
-                print(f"Processed database id={row_id}: {page_url}")
+                print(f"Generated frames for id={row_id}; URL will be stored after Pages deploy.")
             except Exception as exc:
                 if folder and folder.exists():
                     shutil.rmtree(folder, ignore_errors=True)
+                error = str(exc)[:1500]
                 conn.execute(
-                    "UPDATE doggirlx SET frames_status = %s WHERE id = %s",
-                    (f"error: {str(exc)[:450]}", row_id),
+                    """UPDATE doggirlx
+                       SET frames_status = 'error', frames_error = %s
+                       WHERE id = %s""",
+                    (error, row_id),
                 )
-                print(f"Failed database id={row_id}: {exc}")
+                print(f"Failed database id={row_id}: {error}")
+
+        remaining = conn.execute(
+            """SELECT EXISTS (
+                 SELECT 1 FROM doggirlx
+                 WHERE video_src IS NOT NULL
+                   AND COALESCE(frames_url, '') = ''
+                   AND (
+                     frames_status = 'pending'
+                     OR (frames_status = 'error' AND frames_attempts < %s)
+                   )
+               )""",
+            (MAX_ATTEMPTS,),
+        ).fetchone()[0]
+        output_path = os.getenv("GITHUB_OUTPUT")
+        if output_path:
+            with open(output_path, "a", encoding="utf-8") as output:
+                output.write(f"has_more={'true' if remaining else 'false'}\n")
 
 
 if __name__ == "__main__":
