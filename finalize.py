@@ -1,46 +1,43 @@
 import os
-import re
 from pathlib import Path
-from urllib.parse import urlparse
-from html import escape
 
 import psycopg
 
+
 REPO = "hems5683/special-umbrella-doggirlx"
 SITE_BASE = f"https://{REPO.split('/')[0]}.github.io/{REPO.split('/')[1]}"
-
-
-def safe_stem(source, row_id):
-    source = str(source)
-    name = urlparse(source).path.rsplit("/", 1)[-1] if source.startswith(("http://", "https://")) else source
-    name = name.removeprefix("b2/").rsplit("/", 1)[-1]
-    name = re.sub(r"\.mp4$", "", name, flags=re.IGNORECASE)
-    name = re.sub(r"[^A-Za-z0-9_-]+", "-", name).strip("-_")
-    return name[:100] or f"video-{row_id}"
 
 
 def main():
     database_url = os.environ["DATABASE_URL"]
     with psycopg.connect(database_url, autocommit=True) as conn:
         rows = conn.execute(
-            """SELECT id, video_src FROM doggirlx
+            """SELECT id, frames_path FROM doggirlx
                WHERE frames_status = 'generated'
-                 AND COALESCE(frames_url, '') = ''"""
+                 AND frames_path IS NOT NULL
+                 AND frames_path <> ''"""
         ).fetchall()
-        for row_id, source in rows:
-            folder = Path("frames") / f"{row_id}-{safe_stem(source, row_id)}"
+
+        for row_id, frames_path in rows:
+            folder = Path(str(frames_path).rstrip("/"))
             if not (folder / "index.html").is_file():
-                print(f"Skip id={row_id}: generated gallery folder not present in checkout")
+                print(
+                    f"Skip id={row_id}: gallery folder not present at "
+                    f"{frames_path!r}"
+                )
                 continue
-            url = f"{SITE_BASE}/{folder.as_posix()}/"
+
             conn.execute(
                 """UPDATE doggirlx
-                   SET frames_url = %s, frames_status = 'done',
-                       frames_error = NULL
+                   SET frames_status = 'done', frames_error = NULL
                    WHERE id = %s""",
-                (url, row_id),
+                (row_id,),
             )
-            print(f"Published gallery URL saved for id={row_id}: {url}")
+            public_url = f"{SITE_BASE}/{str(frames_path).strip('/')}/"
+            print(
+                f"Gallery published for id={row_id}; "
+                f"path={frames_path}; url={public_url}"
+            )
 
 
 if __name__ == "__main__":
